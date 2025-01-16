@@ -3,11 +3,11 @@ os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="0"
 import numpy as np
 
-from train import IM_SVAE
+from train import IM_VAE
 # from modelSVR import IM_SVR
 # from VAE_train import IM_VAE
 # from c2f_train import IM_C2F
-from train import IM_SVAE
+# from train import IM_SVAE
 import argparse
 import h5py
 
@@ -28,7 +28,7 @@ parser.add_argument("--train", action="store_true", dest="train", default=False,
 parser.add_argument("--start", action="store", dest="start", default=0, type=int, help="In testing, output shapes [start:end]")
 parser.add_argument("--end", action="store", dest="end", default=16, type=int, help="In testing, output shapes [start:end]")
 parser.add_argument("--ae", action="store_true", dest="ae", default=False, help="True for ae [False]")
-parser.add_argument("--svae", action="store_true", dest="svae", default=False, help="True for svae [False]")
+parser.add_argument("--vae", action="store_true", dest="vae", default=False, help="True for vae [False]")
 # parser.add_argument("--c2f", action="store_true", dest="c2f", default=False, help="True for c2f [False]")
 # parser.add_argument("--getz", action="store_true", dest="getz", default=False, help="True for getting latent codes [False]")
 FLAGS = parser.parse_args()
@@ -48,8 +48,8 @@ if FLAGS.train:
 	# elif FLAGS.c2f:
 	# 	im_ae=IM_C2F(FLAGS)
 	# 	im_ae.train(FLAGS)
-	if FLAGS.svae:
-		im_svae=IM_SVAE(FLAGS)
+	if FLAGS.vae:
+		im_svae=IM_VAE(FLAGS)
 		im_svae.train(FLAGS)
 # 	if FLAGS.train:
 # 		im_svr.train(FLAGS)
