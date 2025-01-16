@@ -8,66 +8,107 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
 from torch.autograd import Variable
+import math
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def positional_encoding(points, num_frequencies, include_input=True, log_sampling=True):
+    """
+    Apply positional encoding to 3D coordinates (NeRF-style).
+
+    Args:
+        points: Tensor of shape [B, N, 3], where B is batch size, N is the number of points, and 3 is (x, y, z).
+        num_frequencies: Number of frequency bands for encoding.
+        include_input: Whether to include the original coordinates in the output.
+        log_sampling: Whether to use logarithmic frequency sampling (default: True).
+
+    Returns:
+        Tensor of shape [B, N, 3 * (2 * num_frequencies) + (3 if include_input else 0)].
+    """
+    # Determine frequency bands
+    if log_sampling:
+        frequencies = 2. ** torch.linspace(0., num_frequencies - 1, num_frequencies).to(points.device)
+    else:
+        frequencies = torch.linspace(1.0, 2. ** (num_frequencies - 1), num_frequencies).to(points.device)
+
+    # Compute positional encodings
+    encoded = []
+    if include_input:
+        encoded.append(points)  # Include the original coordinates
+
+    for freq in frequencies:
+        encoded.append(torch.sin(points * freq * math.pi))  # Scale by π for NeRF-style encoding
+        encoded.append(torch.cos(points * freq * math.pi))
+
+    # Concatenate original coordinates and encoded features
+    return torch.cat(encoded, dim=-1)
 
 class generator(nn.Module):
-    def __init__(self, z_dim, point_dim, gf_dim):
+    def __init__(self, z_dim, point_dim, gf_dim, num_frequencies=10, include_input=True):
         super(generator, self).__init__()
         self.z_dim = z_dim
         self.point_dim = point_dim
         self.gf_dim = gf_dim
-        
-        self.linear_1 = nn.Linear(self.z_dim+self.point_dim, self.gf_dim*8, bias=True)
-        self.linear_2 = nn.Linear(self.gf_dim*8, self.gf_dim*8, bias=True)
-        self.linear_3 = nn.Linear(self.gf_dim*8, self.gf_dim*8, bias=True)
-        self.linear_4 = nn.Linear(self.gf_dim*8, self.gf_dim*4, bias=True)
-        self.linear_5 = nn.Linear(self.gf_dim*4, self.gf_dim*2, bias=True)
-        self.linear_6 = nn.Linear(self.gf_dim*2, self.gf_dim*1, bias=True)
-        self.linear_7 = nn.Linear(self.gf_dim*1, 1, bias=True)
-        
+        self.num_frequencies = num_frequencies
+        self.include_input = include_input  # Include raw input coordinates in PE
+
+        # Update the input dimension based on positional encoding
+        self.encoded_dim = self.point_dim * (2 * self.num_frequencies)  # Sin and cos
+        if self.include_input:
+            self.encoded_dim += self.point_dim  # Add raw input coordinates
+
+        self.input_dim = self.z_dim + self.encoded_dim
+
+        # Define network layers
+        self.linear_1 = nn.Linear(self.input_dim, self.gf_dim * 8, bias=True)
+        self.linear_2 = nn.Linear(self.gf_dim * 8, self.gf_dim * 8, bias=True)
+        self.linear_3 = nn.Linear(self.gf_dim * 8, self.gf_dim * 8, bias=True)
+        self.linear_4 = nn.Linear(self.gf_dim * 8, self.gf_dim * 4, bias=True)
+        self.linear_5 = nn.Linear(self.gf_dim * 4, self.gf_dim * 2, bias=True)
+        self.linear_6 = nn.Linear(self.gf_dim * 2, self.gf_dim * 1, bias=True)
+        self.linear_7 = nn.Linear(self.gf_dim * 1, 1, bias=True)
+
         # Initialize weights
-        for layer in [self.linear_1, self.linear_2, self.linear_3, 
-                     self.linear_4, self.linear_5, self.linear_6]:
+        for layer in [self.linear_1, self.linear_2, self.linear_3,
+                      self.linear_4, self.linear_5, self.linear_6]:
             nn.init.normal_(layer.weight, mean=0.0, std=0.05)
             nn.init.constant_(layer.bias, 0)
-        
+
         nn.init.normal_(self.linear_7.weight, mean=0.0, std=0.05)
         nn.init.constant_(self.linear_7.bias, 0)
 
     def forward(self, points, z, chunk_size):
-        
-
         # Ensure consistent shapes
         if len(points.shape) == 2:
             points = points.unsqueeze(0)  # [1, N, 3]
-        
+
         batch_size = points.size(0)
         num_points = points.size(1)
-        
-        # Ensure z has correct shape
+
+        # Apply positional encoding to points
+        points_encoded = positional_encoding(points, self.num_frequencies, include_input=self.include_input)  # [B, N, encoded_dim]
+
+        # Ensure z has the correct shape
         if len(z.shape) == 1:
             z = z.unsqueeze(0)  # [1, z_dim]
         elif len(z.shape) == 2 and z.size(0) != batch_size:
             z = z.repeat(batch_size, 1)
-        
+
         # Expand z to match points
         zs = z.unsqueeze(1).expand(batch_size, num_points, -1)
-        
-        # Concatenate points and z
-        pointz = torch.cat([points, zs], dim=-1)
-        
-        # Process in chunks consistent with the chunk_size below
-        
+
+        # Concatenate encoded points and z
+        pointz = torch.cat([points_encoded, zs], dim=-1)  # [B, N, input_dim]
+
+        # Process in chunks
         outputs = []
-        
         for i in range(0, num_points, chunk_size):
             end_idx = min(i + chunk_size, num_points)
             chunk = pointz[:, i:end_idx, :]
-            
+
             # Maintain batch dimension
-            chunk_flat = chunk.reshape(-1, self.z_dim + self.point_dim)
-            
+            chunk_flat = chunk.reshape(-1, self.input_dim)
+
             l1 = F.leaky_relu(self.linear_1(chunk_flat), negative_slope=0.02)
             l2 = F.leaky_relu(self.linear_2(l1), negative_slope=0.02)
             l3 = F.leaky_relu(self.linear_3(l2), negative_slope=0.02)
@@ -75,16 +116,15 @@ class generator(nn.Module):
             l5 = F.leaky_relu(self.linear_5(l4), negative_slope=0.02)
             l6 = F.leaky_relu(self.linear_6(l5), negative_slope=0.02)
             l7 = self.linear_7(l6)
-            
+
             # Reshape back to batch dimension
             chunk_output = l7.view(batch_size, end_idx - i, 1)
             outputs.append(chunk_output)
-        
+
         # Combine chunks
         density = torch.cat(outputs, dim=1)  # [B, N, 1]
-        
-        return density.squeeze(-1)  # Returns [B, N]
 
+        return density.squeeze(-1)  # Returns [B, N]
 
 class encoder(nn.Module):
     def __init__(self, ef_dim, z_dim):
