@@ -44,23 +44,15 @@ def positional_encoding(points, num_frequencies, include_input=True, log_samplin
     return torch.cat(encoded, dim=-1)
 
 class generator(nn.Module):
-    def __init__(self, z_dim, point_dim, gf_dim, num_frequencies=10, include_input=True):
+    def __init__(self, z_dim, point_dim, gf_dim, include_input=True):
         super(generator, self).__init__()
         self.z_dim = z_dim
         self.point_dim = point_dim
         self.gf_dim = gf_dim
-        self.num_frequencies = num_frequencies
+        # self.num_frequencies = num_frequencies
         self.include_input = include_input  # Include raw input coordinates in PE
 
-        # Update the input dimension based on positional encoding
-        self.encoded_dim = self.point_dim * (2 * self.num_frequencies)  # Sin and cos
-        if self.include_input:
-            self.encoded_dim += self.point_dim  # Add raw input coordinates
 
-        self.input_dim = self.z_dim + self.encoded_dim
-
-        # Define network layers
-        self.linear_1 = nn.Linear(self.input_dim, self.gf_dim * 8, bias=True)
         self.linear_2 = nn.Linear(self.gf_dim * 8, self.gf_dim * 8, bias=True)
         self.linear_3 = nn.Linear(self.gf_dim * 8, self.gf_dim * 8, bias=True)
         self.linear_4 = nn.Linear(self.gf_dim * 8, self.gf_dim * 4, bias=True)
@@ -69,15 +61,26 @@ class generator(nn.Module):
         self.linear_7 = nn.Linear(self.gf_dim * 1, 1, bias=True)
 
         # Initialize weights
-        for layer in [self.linear_1, self.linear_2, self.linear_3,
-                      self.linear_4, self.linear_5, self.linear_6]:
+        for layer in [self.linear_2, self.linear_3, self.linear_4, self.linear_5, self.linear_6]:
             nn.init.normal_(layer.weight, mean=0.0, std=0.05)
             nn.init.constant_(layer.bias, 0)
 
         nn.init.normal_(self.linear_7.weight, mean=0.0, std=0.05)
         nn.init.constant_(self.linear_7.bias, 0)
 
-    def forward(self, points, z, chunk_size):
+    def forward(self, points, z, chunk_size, num_frequencies):
+        # Dynamically calculate encoded_dim based on num_frequencies
+        encoded_dim = self.point_dim * (2 * num_frequencies)  # Sin and cos
+        if self.include_input:
+            encoded_dim += self.point_dim  # Add raw input coordinates
+
+        input_dim = self.z_dim + encoded_dim
+
+        # Dynamically create the first linear layer
+        linear_1 = nn.Linear(input_dim, self.gf_dim * 8, bias=True).to(points.device)
+        nn.init.normal_(linear_1.weight, mean=0.0, std=0.05)
+        nn.init.constant_(linear_1.bias, 0)
+
         # Ensure consistent shapes
         if len(points.shape) == 2:
             points = points.unsqueeze(0)  # [1, N, 3]
@@ -85,8 +88,8 @@ class generator(nn.Module):
         batch_size = points.size(0)
         num_points = points.size(1)
 
-        # Apply positional encoding to points
-        points_encoded = positional_encoding(points, self.num_frequencies, include_input=self.include_input)  # [B, N, encoded_dim]
+        # Apply positional encoding with the current number of frequencies
+        points_encoded = positional_encoding(points, num_frequencies, include_input=self.include_input)
 
         # Ensure z has the correct shape
         if len(z.shape) == 1:
@@ -107,9 +110,9 @@ class generator(nn.Module):
             chunk = pointz[:, i:end_idx, :]
 
             # Maintain batch dimension
-            chunk_flat = chunk.reshape(-1, self.input_dim)
+            chunk_flat = chunk.reshape(-1, input_dim)
 
-            l1 = F.leaky_relu(self.linear_1(chunk_flat), negative_slope=0.02)
+            l1 = F.leaky_relu(linear_1(chunk_flat), negative_slope=0.02)
             l2 = F.leaky_relu(self.linear_2(l1), negative_slope=0.02)
             l3 = F.leaky_relu(self.linear_3(l2), negative_slope=0.02)
             l4 = F.leaky_relu(self.linear_4(l3), negative_slope=0.02)
@@ -125,6 +128,7 @@ class generator(nn.Module):
         density = torch.cat(outputs, dim=1)  # [B, N, 1]
 
         return density.squeeze(-1)  # Returns [B, N]
+
 
 class encoder(nn.Module):
     def __init__(self, ef_dim, z_dim):
@@ -196,8 +200,8 @@ class IM_VAE(object):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.max_to_keep = 1
         self.point_dim = 3
-        self.ef_dim = 256
-        self.gf_dim = 256
+        self.ef_dim = 256 
+        self.gf_dim = 256 ## increased from 256 to 512
         self.z_dim = 32
         self.dataset_name = config.dataset
         self.checkpoint_dir = config.checkpoint_dir
@@ -319,6 +323,14 @@ class IM_VAE(object):
         epoch_loss_sum = 0
         total_batches = 0
 
+        # Dynamically adjust the number of frequencies
+        if epoch < 10:
+            num_frequencies = 10  # Start with lower frequencies
+        elif epoch < 20:
+            num_frequencies = 20  # Add more frequencies
+        else:
+            num_frequencies = 30  # Use full frequencies
+        print(f"Num of frequency: {num_frequencies}")
         # Open the data file
         with h5py.File(data_file, 'r') as f:
             file_names = list(f.keys())
@@ -396,7 +408,7 @@ class IM_VAE(object):
                             values_chunk = torch.from_numpy(values[chunk_start:chunk_end]).float().to(self.device)
 
                             self.optimizer.zero_grad()
-                            predicted_densities = self.network.generator(points_chunk, z_avg, chunk_end - chunk_start)
+                            predicted_densities = self.network.generator(points_chunk, z_avg, chunk_end - chunk_start, num_frequencies)
 
                             predicted_densities = predicted_densities.contiguous().view(-1, 1)
                             values_chunk = values_chunk.contiguous().view(-1, 1)
@@ -480,42 +492,3 @@ class IM_VAE(object):
                     print(f"Removed old checkpoint: {checkpoint_path}")
                 except Exception as e:
                     print(f"Error removing checkpoint {checkpoint_path}: {e}")
-
-    # def load_best_checkpoint(self):
-    #     """Load the best checkpoint if it exists."""
-    #     best_checkpoint_path = os.path.join(self.checkpoint_path, f"best_{self.checkpoint_name}.pth")
-        
-    #     if os.path.exists(best_checkpoint_path):
-    #         print(f"Loading best checkpoint from {best_checkpoint_path}")
-    #         checkpoint = torch.load(best_checkpoint_path)
-            
-    #         self.network.load_state_dict(checkpoint['model_state_dict'])
-    #         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    #         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            
-    #         epoch = checkpoint['epoch']
-    #         loss = checkpoint.get('loss', float('inf'))
-    #         print(f"Loaded checkpoint from epoch {epoch} with loss {loss:.6f}")
-    #         return epoch + 1  # Return next epoch to start from
-    #     else:
-    #         print("No checkpoint found. Starting from scratch.")
-    #         return 0
-
-    # def save_collected_z_vectors(self, z_vectors):
-    #     """Save z vectors collected during training."""
-    #     z_vector_path = '/home/zcy/seperate_VAE/z_vectors.hdf5'
-        
-    #     if os.path.exists(z_vector_path):
-    #         os.remove(z_vector_path)
-        
-    #     print("\nSaving z-vectors...")
-    #     with h5py.File(z_vector_path, 'w') as f_out:
-    #         for file_name, vectors in z_vectors.items():
-    #             try:
-    #                 group = f_out.create_group(file_name)
-    #                 for key, value in vectors.items():
-    #                     group.create_dataset(key, data=value, compression='gzip')
-    #             except Exception as e:
-    #                 print(f"Error saving vectors for {file_name}: {e}")
-        
-    #     print(f"Z-vectors saved to {z_vector_path}")
