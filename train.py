@@ -7,207 +7,23 @@ import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
-from torch.autograd import Variable
-import math
 
-
-
-def positional_encoding(points, num_frequencies, include_input=True, log_sampling=True):
-    """
-    Apply positional encoding to 3D coordinates (NeRF-style).
-
-    Args:
-        points: Tensor of shape [B, N, 3], where B is batch size, N is the number of points, and 3 is (x, y, z).
-        num_frequencies: Number of frequency bands for encoding.
-        include_input: Whether to include the original coordinates in the output.
-        log_sampling: Whether to use logarithmic frequency sampling (default: True).
-
-    Returns:
-        Tensor of shape [B, N, 3 * (2 * num_frequencies) + (3 if include_input else 0)].
-    """
-    # Determine frequency bands
-    if log_sampling:
-        frequencies = 2. ** torch.linspace(0., num_frequencies - 1, num_frequencies).to(points.device)
-    else:
-        frequencies = torch.linspace(1.0, 2. ** (num_frequencies - 1), num_frequencies).to(points.device)
-
-    # Compute positional encodings
-    encoded = []
-    if include_input:
-        encoded.append(points)  # Include the original coordinates
-
-    for freq in frequencies:
-        encoded.append(torch.sin(points * freq * math.pi))  # Scale by π for NeRF-style encoding
-        encoded.append(torch.cos(points * freq * math.pi))
-
-    # Concatenate original coordinates and encoded features
-    return torch.cat(encoded, dim=-1)
-
-class generator(nn.Module):
-    def __init__(self, z_dim, point_dim, gf_dim, include_input=True):
-        super(generator, self).__init__()
-        self.z_dim = z_dim
-        self.point_dim = point_dim
-        self.gf_dim = gf_dim
-        # self.num_frequencies = num_frequencies
-        self.include_input = include_input  # Include raw input coordinates in PE
-
-
-        self.linear_2 = nn.Linear(self.gf_dim * 8, self.gf_dim * 8, bias=True)
-        self.linear_3 = nn.Linear(self.gf_dim * 8, self.gf_dim * 8, bias=True)
-        self.linear_4 = nn.Linear(self.gf_dim * 8, self.gf_dim * 4, bias=True)
-        self.linear_5 = nn.Linear(self.gf_dim * 4, self.gf_dim * 2, bias=True)
-        self.linear_6 = nn.Linear(self.gf_dim * 2, self.gf_dim * 1, bias=True)
-        self.linear_7 = nn.Linear(self.gf_dim * 1, 1, bias=True)
-
-        # Initialize weights
-        for layer in [self.linear_2, self.linear_3, self.linear_4, self.linear_5, self.linear_6]:
-            nn.init.normal_(layer.weight, mean=0.0, std=0.05)
-            nn.init.constant_(layer.bias, 0)
-
-        nn.init.normal_(self.linear_7.weight, mean=0.0, std=0.05)
-        nn.init.constant_(self.linear_7.bias, 0)
-
-    def forward(self, points, z, chunk_size, num_frequencies):
-        # Dynamically calculate encoded_dim based on num_frequencies
-        encoded_dim = self.point_dim * (2 * num_frequencies)  # Sin and cos
-        if self.include_input:
-            encoded_dim += self.point_dim  # Add raw input coordinates
-
-        input_dim = self.z_dim + encoded_dim
-
-        # Dynamically create the first linear layer
-        linear_1 = nn.Linear(input_dim, self.gf_dim * 8, bias=True).to(points.device)
-        nn.init.normal_(linear_1.weight, mean=0.0, std=0.05)
-        nn.init.constant_(linear_1.bias, 0)
-
-        # Ensure consistent shapes
-        if len(points.shape) == 2:
-            points = points.unsqueeze(0)  # [1, N, 3]
-
-        batch_size = points.size(0)
-        num_points = points.size(1)
-
-        # Apply positional encoding with the current number of frequencies
-        points_encoded = positional_encoding(points, num_frequencies, include_input=self.include_input)
-
-        # Ensure z has the correct shape
-        if len(z.shape) == 1:
-            z = z.unsqueeze(0)  # [1, z_dim]
-        elif len(z.shape) == 2 and z.size(0) != batch_size:
-            z = z.repeat(batch_size, 1)
-
-        # Expand z to match points
-        zs = z.unsqueeze(1).expand(batch_size, num_points, -1)
-
-        # Concatenate encoded points and z
-        pointz = torch.cat([points_encoded, zs], dim=-1)  # [B, N, input_dim]
-
-        # Process in chunks
-        outputs = []
-        for i in range(0, num_points, chunk_size):
-            end_idx = min(i + chunk_size, num_points)
-            chunk = pointz[:, i:end_idx, :]
-
-            # Maintain batch dimension
-            chunk_flat = chunk.reshape(-1, input_dim)
-
-            l1 = F.leaky_relu(linear_1(chunk_flat), negative_slope=0.02)
-            l2 = F.leaky_relu(self.linear_2(l1), negative_slope=0.02)
-            l3 = F.leaky_relu(self.linear_3(l2), negative_slope=0.02)
-            l4 = F.leaky_relu(self.linear_4(l3), negative_slope=0.02)
-            l5 = F.leaky_relu(self.linear_5(l4), negative_slope=0.02)
-            l6 = F.leaky_relu(self.linear_6(l5), negative_slope=0.02)
-            l7 = self.linear_7(l6)
-
-            # Reshape back to batch dimension
-            chunk_output = l7.view(batch_size, end_idx - i, 1)
-            outputs.append(chunk_output)
-
-        # Combine chunks
-        density = torch.cat(outputs, dim=1)  # [B, N, 1]
-
-        return density.squeeze(-1)  # Returns [B, N]
-
-
-class encoder(nn.Module):
-    def __init__(self, ef_dim, z_dim):
-        super(encoder, self).__init__()
-        self.ef_dim = ef_dim
-        self.z_dim = z_dim
-        
-        self.point_net = nn.Sequential(
-            nn.Linear(3, self.ef_dim),
-            nn.LayerNorm(self.ef_dim),
-            nn.LeakyReLU(0.02),
-            nn.Linear(self.ef_dim, self.ef_dim*2),
-            nn.LayerNorm(self.ef_dim*2),
-            nn.LeakyReLU(0.02),
-            nn.Linear(self.ef_dim*2, self.ef_dim*4),
-            nn.LayerNorm(self.ef_dim*4),
-            nn.LeakyReLU(0.02)
-        )
-        
-        # Separate layers for mean and log variance
-        self.fc_mu = nn.Sequential(
-            nn.Linear(self.ef_dim*4, self.ef_dim*8),
-            nn.LayerNorm(self.ef_dim*8),
-            nn.LeakyReLU(0.02),
-            nn.Linear(self.ef_dim*8, self.z_dim)
-        )
-        
-        self.fc_logvar = nn.Sequential(
-            nn.Linear(self.ef_dim*4, self.ef_dim*8),
-            nn.LayerNorm(self.ef_dim*8),
-            nn.LeakyReLU(0.02),
-            nn.Linear(self.ef_dim*8, self.z_dim)
-        )
-    
-    def forward(self, points, is_training=False):
-        if len(points.shape) == 2:
-            points = points.unsqueeze(0)
-        
-        B, N, C = points.shape
-        assert C == 3, f"Expected points to have 3 coordinates, got {C}"
-        
-        points_flat = points.reshape(-1, 3)
-        point_features = self.point_net(points_flat)
-        point_features = point_features.reshape(B, N, -1)
-        
-        global_features = torch.max(point_features, dim=1)[0]
-        
-        mu = self.fc_mu(global_features)
-        logvar = self.fc_logvar(global_features)
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + eps * std
-        
-        return mu, logvar, z
-
-class im_network(nn.Module):
-    def __init__(self, ef_dim, gf_dim, z_dim, point_dim):
-        super(im_network, self).__init__()
-        self.ef_dim = ef_dim
-        self.gf_dim = gf_dim
-        self.z_dim = z_dim
-        self.point_dim = point_dim
-        self.encoder = encoder(self.ef_dim, self.z_dim)
-        self.generator = generator(self.z_dim, self.point_dim, self.gf_dim)
-
+# import math
+from VAE_network import *
 
 class IM_VAE(object):
     def __init__(self, config):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.max_to_keep = 1
         self.point_dim = 3
-        self.ef_dim = 256 
-        self.gf_dim = 256 ## increased from 256 to 512
-        self.z_dim = 32
+        self.ef_dim = 256
+        self.gf_dim = 256
+        self.chunk_size = 100000
+        self.z_dim = 256
         self.dataset_name = config.dataset
         self.checkpoint_dir = config.checkpoint_dir
         self.data_dir = config.data_dir
         self.grad_clip = 5.0
-        self.chunk_size = 100000
         self.checkpoint_path = os.path.join(self.checkpoint_dir, self.model_dir)
         
         # Single network for both positive and negative values
@@ -217,16 +33,20 @@ class IM_VAE(object):
         initial_lr = config.learning_rate
         
         # Single optimizer
-        self.optimizer = optim.Adam([
+        self.optimizer = optim.AdamW([
             {'params': self.network.parameters(), 'initial_lr': initial_lr}
         ], lr=initial_lr, betas=(config.beta1, 0.999))
 
         # Single scheduler
-        self.scheduler = optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=30, gamma=0.1,
-            last_epoch=config.epoch-1 if hasattr(config, 'epoch') else -1
-        )
-
+        # self.scheduler = optim.lr_scheduler.StepLR(
+        #     self.optimizer, step_size=30, gamma=0.1,
+        #     last_epoch=config.epoch-1 if hasattr(config, 'epoch') else -1
+        # )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=100,
+            last_epoch=config.epoch-1 if hasattr(config, 'epoch') else -1)
+        
+        
         self.checkpoint_name = 'IM_VAE.model'
         self.checkpoint_manager_list = [None] * self.max_to_keep
         self.checkpoint_manager_pointer = 0
@@ -234,41 +54,43 @@ class IM_VAE(object):
         self.beta = 0.01  # KL divergence weight
 
 
-    def combined_loss(self, predicted_density, true_density, mu, logvar):
-        # Basic losses
-        point_wise_mse = F.mse_loss(predicted_density, true_density, reduction='none')
-        # point_wise_l1 = F.l1_loss(predicted_density, true_density, reduction='none')
+    # def combined_loss(self, predicted_density, true_density):
+    #     # Basic losses
+    #     point_wise_mse = F.mse_loss(predicted_density, true_density, reduction='none')
         
-        # Safe relative error calculation
-        relative_error = point_wise_mse / (true_density.abs() + 1e-4)
-        loss_threshold = torch.quantile(relative_error, 0.5)
+    #     # Safe relative error calculation
+    #     relative_error = point_wise_mse / (true_density.abs() + 1e-4)
+    #     loss_threshold = torch.quantile(relative_error, 0.75)
         
-        # Soft weighting for high-error points
-        weights = 1.0 + torch.sigmoid(10 * (relative_error - loss_threshold))
+    #     # Soft weighting for high-error points
+    #     weights = 1.0 + torch.sigmoid(10 * (relative_error - loss_threshold))
         
-        # Weighted losses
-        weighted_mse = (point_wise_mse * weights).mean()
-        # weighted_l1 = (point_wise_l1 * weights).mean()
-        
-        # # First-order and second-order gradient losses
-        # first_derivative = torch.abs(predicted_density[1:] - predicted_density[:-1])
-        # second_derivative = torch.abs(predicted_density[2:] - 2 * predicted_density[1:-1] + predicted_density[:-2])
-        # first_gradient_loss = torch.mean(first_derivative)
-        # second_gradient_loss = torch.mean(second_derivative)
-        # gradient_loss = 1000 * (first_gradient_loss + second_gradient_loss)
-        
-        # Combine losses
-        # recon_loss = weighted_mse + gradient_loss
-        
-        # exit()
-        # KL divergence
-        # kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        # print(weighted_mse.item(), gradient_loss.item())
-        # # Total loss
-        # total_loss = recon_loss + 0.1 * kl_divergence
-        total_loss = weighted_mse
-        return total_loss
+    #     # Weighted losses
+    #     weighted_mse = (point_wise_mse * weights).mean()
+    #     total_loss = weighted_mse
+    #     return total_loss
 
+    def unmodified_loss(self, predicted_density, true_density):
+       point_wise_mse = F.mse_loss(predicted_density, true_density, reduction='none')
+       return point_wise_mse.mean()
+
+    # def combined_loss(self, predicted_density, true_density):
+
+    #     point_wise_mse = F.mse_loss(predicted_density, true_density, reduction='none')
+        
+    #     # Value-based importance
+    #     value_weights = (true_density.abs() + 1e-4) / (true_density.abs().mean() + 1e-4)
+        
+    #     # Error-based importance
+    #     error_weights = torch.ones_like(point_wise_mse)
+    #     high_error_mask = point_wise_mse > torch.quantile(point_wise_mse, 0.5)
+    #     error_weights[high_error_mask] = 2.0  # Double weight for high errors
+        
+    #     # Combined weighting
+    #     weights = value_weights * error_weights
+    #     weighted_mse = (point_wise_mse * weights).mean()
+        
+    #     return weighted_mse
 
     @property
     def model_dir(self):
@@ -291,14 +113,18 @@ class IM_VAE(object):
         print(f"Learning rate: {config.learning_rate}")
         print("-" * 40 + "\n")
 
+        # if os.path.exists(z_file_path):
+        #     os.remove(z_file_path)
+       
+
         for epoch in range(start_epoch, config.epoch):
             epoch_start_time = time.time()
             print(f"\nEpoch {epoch + 1}/{config.epoch}")
             print("=" * 40)
 
             # Determine whether to save or load z vectors
-            save_z = (epoch == 0)  # Save z vectors only in the first epoch
-            use_precomputed_z = os.path.exists(z_file_path) and not save_z
+            save_z = not (os.path.exists(z_file_path))  # Save z vectors only in the first epoch
+            use_precomputed_z = os.path.exists(z_file_path)
 
             # Train for one epoch
             epoch_loss = self.train_epoch(epoch, config, data_dir, z_file_path, save_z=save_z, use_precomputed_z=use_precomputed_z)
@@ -323,14 +149,6 @@ class IM_VAE(object):
         epoch_loss_sum = 0
         total_batches = 0
 
-        # Dynamically adjust the number of frequencies
-        if epoch < 10:
-            num_frequencies = 10  # Start with lower frequencies
-        elif epoch < 20:
-            num_frequencies = 20  # Add more frequencies
-        else:
-            num_frequencies = 30  # Use full frequencies
-        print(f"Num of frequency: {num_frequencies}")
         # Open the data file
         with h5py.File(data_file, 'r') as f:
             file_names = list(f.keys())
@@ -406,14 +224,19 @@ class IM_VAE(object):
 
                             points_chunk = torch.from_numpy(points[chunk_start:chunk_end]).float().to(self.device)
                             values_chunk = torch.from_numpy(values[chunk_start:chunk_end]).float().to(self.device)
-
+                            # print(points_chunk.shape)
                             self.optimizer.zero_grad()
-                            predicted_densities = self.network.generator(points_chunk, z_avg, chunk_end - chunk_start, num_frequencies)
-
-                            predicted_densities = predicted_densities.contiguous().view(-1, 1)
-                            values_chunk = values_chunk.contiguous().view(-1, 1)
-
-                            loss = self.combined_loss(predicted_densities, values_chunk, mu_avg, logvar_avg)
+                            predicted_densities = self.network.generator(points_chunk, z_avg)
+                            # print(predicted_densities.shape, values_chunk.shape)
+                            # exit()
+                            if predicted_densities.shape != values_chunk.shape:
+                                raise Exception("shape of generator and ground truth not matched!")
+                
+                            # predicted_densities = predicted_densities.contiguous().view(-1, 1)
+                            # values_chunk = values_chunk.contiguous().view(-1, 1)
+                            
+                            # loss = self.combined_loss(predicted_densities, values_chunk)
+                            loss = self.unmodified_loss(predicted_densities, values_chunk)
                             loss.backward()
                             torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.grad_clip)
                             self.optimizer.step()

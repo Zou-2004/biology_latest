@@ -5,16 +5,16 @@ import os
 from train import im_network
 import h5py
 from tqdm import tqdm
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 class DensityPredictor:
     def __init__(self, checkpoint_path, device='cuda'):
         self.device = device
         self.point_dim = 3
         self.ef_dim = 256
         self.gf_dim = 256
-        self.z_dim = 32
+        self.z_dim = 256
         self.chunk_size = 100000
-        
+        self.num_ferquencies=10
         # Load network
         self.network = im_network(self.ef_dim, self.gf_dim, self.z_dim, self.point_dim).to(device)
         
@@ -37,13 +37,13 @@ class DensityPredictor:
                 
                 with torch.no_grad():
                     coords_tensor = torch.from_numpy(chunk_coords).float().to(self.device)
-                    if len(coords_tensor.shape) == 2:
-                        coords_tensor = coords_tensor.unsqueeze(0)
+                    # if len(coords_tensor.shape) == 2:
+                    #     coords_tensor = coords_tensor.unsqueeze(0)
                     
                     z_tensor = z_vector.to(self.device)
                     
                     # Get predictions
-                    chunk_pred = self.network.generator(coords_tensor, z_tensor, self.chunk_size)
+                    chunk_pred = self.network.generator(coords_tensor, z_tensor)
                     chunk_values = chunk_pred.cpu().numpy()
                     
                     # Store the predictions
