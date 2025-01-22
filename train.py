@@ -70,27 +70,27 @@ class IM_VAE(object):
     #     total_loss = weighted_mse
     #     return total_loss
 
-    def unmodified_loss(self, predicted_density, true_density):
-       point_wise_mse = F.mse_loss(predicted_density, true_density, reduction='none')
-       return point_wise_mse.mean()
+    # def unmodified_loss(self, predicted_density, true_density):
+    #    point_wise_mse = F.mse_loss(predicted_density, true_density, reduction='none')
+    #    return point_wise_mse.mean()
 
-    # def combined_loss(self, predicted_density, true_density):
+    def combined_loss(self, predicted_density, true_density):
 
-    #     point_wise_mse = F.mse_loss(predicted_density, true_density, reduction='none')
+        point_wise_mse = F.mse_loss(predicted_density, true_density, reduction='none')
         
-    #     # Value-based importance
-    #     value_weights = (true_density.abs() + 1e-4) / (true_density.abs().mean() + 1e-4)
+        # Value-based importance
+        value_weights = (true_density.abs() + 1e-4) / (true_density.abs().mean() + 1e-4)
         
-    #     # Error-based importance
-    #     error_weights = torch.ones_like(point_wise_mse)
-    #     high_error_mask = point_wise_mse > torch.quantile(point_wise_mse, 0.5)
-    #     error_weights[high_error_mask] = 2.0  # Double weight for high errors
+        # Error-based importance
+        error_weights = torch.ones_like(point_wise_mse)
+        high_error_mask = point_wise_mse > torch.quantile(point_wise_mse, 0.5)
+        error_weights[high_error_mask] = 2.0  # Double weight for high errors
         
-    #     # Combined weighting
-    #     weights = value_weights * error_weights
-    #     weighted_mse = (point_wise_mse * weights).mean()
+        # Combined weighting
+        weights = value_weights * error_weights
+        weighted_mse = (point_wise_mse * weights).mean()
         
-    #     return weighted_mse
+        return weighted_mse
 
     @property
     def model_dir(self):
@@ -113,18 +113,18 @@ class IM_VAE(object):
         print(f"Learning rate: {config.learning_rate}")
         print("-" * 40 + "\n")
 
-        # if os.path.exists(z_file_path):
-        #     os.remove(z_file_path)
+        if os.path.exists(z_file_path):
+            os.remove(z_file_path)
        
 
         for epoch in range(start_epoch, config.epoch):
             epoch_start_time = time.time()
             print(f"\nEpoch {epoch + 1}/{config.epoch}")
             print("=" * 40)
-
+            save_z=(epoch==0)
             # Determine whether to save or load z vectors
-            save_z = not (os.path.exists(z_file_path))  # Save z vectors only in the first epoch
-            use_precomputed_z = os.path.exists(z_file_path)
+            # save_z = not (os.path.exists(z_file_path))  #uncomment when ur file aren't changed
+            use_precomputed_z = os.path.exists(z_file_path) and (epoch!=0)
 
             # Train for one epoch
             epoch_loss = self.train_epoch(epoch, config, data_dir, z_file_path, save_z=save_z, use_precomputed_z=use_precomputed_z)
@@ -236,7 +236,7 @@ class IM_VAE(object):
                             # values_chunk = values_chunk.contiguous().view(-1, 1)
                             
                             # loss = self.combined_loss(predicted_densities, values_chunk)
-                            loss = self.unmodified_loss(predicted_densities, values_chunk)
+                            loss = self.combined_loss(predicted_densities, values_chunk)
                             loss.backward()
                             torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.grad_clip)
                             self.optimizer.step()
