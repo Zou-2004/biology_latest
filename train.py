@@ -8,22 +8,6 @@ import time
 import numpy as np
 import h5py
 from VAE_network import *
-# import pdb
-
-
-# print("My code GPU count:", torch.cuda.device_count())
-# print("My code device count before init:", torch.cuda.device_count())
-# for i in range(torch.cuda.device_count()):
-#     print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-def _monitor_gpu_usage(self):
-    if self.rank == 0:  # Only monitor on primary GPU
-        print("\nGPU Usage Statistics:")
-        for i in range(torch.cuda.device_count()):
-            memory_allocated = torch.cuda.memory_allocated(i)
-            memory_reserved = torch.cuda.memory_reserved(i)
-            print(f"GPU {i}:")
-            print(f"  Allocated: {memory_allocated/1e9:.2f} GB")
-            print(f"  Reserved: {memory_reserved/1e9:.2f} GB")
 
 class IM_VAE(object):
     def __init__(self, config):
@@ -41,7 +25,7 @@ class IM_VAE(object):
         self.ef_dim = 256
         self.gf_dim = 256
         self.chunk_size = 100000
-        self.z_dim = 256
+        self.z_dim = 32
         self.dataset_name = config.dataset
         self.checkpoint_dir = config.checkpoint_dir
         self.data_dir = config.data_dir
@@ -50,12 +34,22 @@ class IM_VAE(object):
         
         # Initialize model and move to GPU
         self.network = im_network(self.ef_dim, self.gf_dim, self.z_dim, self.point_dim).to(self.device_id)
-        self.network = DDP(self.network, device_ids=[self.device_id])
-
+        self.network = DDP(
+            self.network, 
+            device_ids=[self.device_id],
+            find_unused_parameters=False, 
+            broadcast_buffers=True 
+        )
+        world_size = dist.get_world_size()
+        self.scaled_lr = config.learning_rate * math.sqrt(world_size)  # Linear scaling
         # Create optimizer with explicit initial_lr
-        self.optimizer = optim.AdamW([
-            {'params': self.network.parameters(), 'initial_lr': config.learning_rate}
-        ], lr=config.learning_rate, betas=(config.beta1, 0.999))
+        self.optimizer = optim.Adam([
+                {'params': self.network.parameters(), 'initial_lr': self.scaled_lr}
+            ], lr=self.scaled_lr)
+       
+        # self.optimizer = optim.Adam([
+        #         {'params': self.network.parameters(), 'initial_lr': config.learning_rate}
+        #     ], lr=config.learning_rate)
 
         # Create scheduler with initial_lr properly set
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -75,11 +69,12 @@ class IM_VAE(object):
         
         # Value-based importance weighting
         value_weights = (true_density.abs() + 1e-4) / (true_density.abs().mean() + 1e-4)
+        value_weights=value_weights**2
         
         # Error-based importance weighting
         error_weights = torch.ones_like(point_wise_mse)
-        high_error_mask = point_wise_mse > torch.quantile(point_wise_mse, 0.5)
-        error_weights[high_error_mask] = 2.0
+        high_error_mask = point_wise_mse > torch.quantile(point_wise_mse, 0.90)
+        error_weights[high_error_mask] = 3.0
         
         # Combined weighting
         weights = value_weights * error_weights
@@ -91,7 +86,15 @@ class IM_VAE(object):
         weighted_mse = (point_wise_mse * weights).mean()
         
         return weighted_mse
+    
+    # def unmodified_loss(self, predicted_density, true_density):
+    #     return F.mse_loss(predicted_density, true_density, reduction='mean')
 
+    def compute_z_vectors(self, points_chunk):
+        with torch.no_grad():
+            mu, logvar, z = self.network.module.encoder(points_chunk)
+            return mu, logvar, z
+        
     @property
     def model_dir(self):
         return f"{self.dataset_name}_density_vae"
@@ -103,7 +106,7 @@ class IM_VAE(object):
             print(f"Z vector dimension: {self.z_dim}")
             print(f"Chunk size: {self.chunk_size}")
             print(f"Total epochs: {config.epoch}")
-            print(f"Learning rate: {config.learning_rate}")
+            print(f"Learning rate: {self.scaled_lr}")
             print(f"Number of GPUs: {torch.cuda.device_count()}")
             
             # Print model statistics
@@ -126,38 +129,48 @@ class IM_VAE(object):
         if self.rank == 0:
             if not os.path.exists(z_file_path):
                 compute_z = True
-                print("Z vector file not found. Will compute z vectors in first epoch.")
+                print("Z vector file not found. Will compute z vectors.")
             else:
-                # Check if data files have changed
-                with h5py.File(data_dir, 'r') as data_f, h5py.File(z_file_path, 'r') as z_f:
-                    data_files = set(data_f.keys())
-                    z_files = set(z_f.keys())
-                    if data_files != z_files:
-                        compute_z = True
-                        print("Data files have changed. Will recompute z vectors in first epoch.")
-                    else:
-                        print("Using existing z vectors from file.")
+                try:
+                    with h5py.File(data_dir, 'r') as data_f, h5py.File(z_file_path, 'r') as z_f:
+                        data_files = set(data_f.keys())
+                        z_files = set(z_f.keys())
+                        if data_files != z_files:
+                            compute_z = True
+                            os.remove(z_file_path)
+                            print("Data files mismatch. Deleted old z_file, will recompute z vectors.")
+                        else:
+                            print("Using existing z vectors from file.")
+                except Exception as e:
+                    print(f"Error checking z_file status: {e}")
+                    if os.path.exists(z_file_path):
+                        os.remove(z_file_path)
+                    compute_z = True
 
         # Broadcast compute_z decision to all processes
         compute_z = torch.tensor([compute_z], dtype=torch.bool, device=self.device_id)
         dist.broadcast(compute_z, src=0)
         compute_z = compute_z.item()
 
+        # Create new z_file if needed
+        if compute_z and self.rank == 0:
+            with h5py.File(z_file_path, 'w') as _:
+                pass
+            print(f"Created new z_file at {z_file_path}")
+
+        dist.barrier()  # Ensure z_file is created before proceeding
+        
         best_loss = float('inf')
         start_epoch = 0
 
         try:
             for epoch in range(start_epoch, config.epoch):
                 epoch_start_time = time.time()
-                dist.barrier()  # Synchronize before epoch starts
+                dist.barrier()
                 
                 if self.rank == 0:
                     print(f"\nEpoch {epoch + 1}/{config.epoch}")
                     print("=" * 40)
-
-                # Compute z vectors only in first epoch if needed
-                use_precomputed_z = not compute_z or epoch > 0
-                save_z = compute_z and epoch == 0
 
                 self.network.train()
                 epoch_loss = self.train_epoch(
@@ -165,14 +178,11 @@ class IM_VAE(object):
                     config, 
                     data_dir, 
                     z_file_path,
-                    save_z=save_z,
-                    use_precomputed_z=use_precomputed_z
+                    compute_z=compute_z
                 )
                     
-                # Step the learning rate scheduler
                 self.scheduler.step()
                 
-                # Calculate and log training metrics
                 if self.rank == 0:
                     epoch_time = time.time() - epoch_start_time
                     current_lr = self.optimizer.param_groups[0]['lr']
@@ -182,7 +192,6 @@ class IM_VAE(object):
                     print(f"Average loss: {epoch_loss:.6f}")
                     print(f"Learning rate: {current_lr:.6e}")
                     
-                    # Save checkpoints
                     if epoch_loss < best_loss:
                         best_loss = epoch_loss
                         self.save_checkpoint(epoch, epoch_loss, is_best=True)
@@ -191,20 +200,16 @@ class IM_VAE(object):
                         self.save_checkpoint(epoch, epoch_loss, is_best=False)
                         print(f"Checkpoint saved. Best loss so far: {best_loss:.6f}")
                     
-                    # Log training progress
                     if (epoch + 1) % 10 == 0:
                         print(f"\nTraining Progress: {(epoch + 1)/config.epoch*100:.1f}%")
                         print(f"Best loss so far: {best_loss:.6f}")
 
-                # Synchronize processes before starting next epoch
                 dist.barrier()
 
         except Exception as e:
             print(f"Rank {self.rank} encountered error: {str(e)}")
             raise e
-
         finally:
-            # Cleanup
             try:
                 dist.barrier()
                 dist.destroy_process_group()
@@ -215,9 +220,8 @@ class IM_VAE(object):
             except Exception as e:
                 print(f"Error during cleanup: {str(e)}")
 
-    def train_epoch(self, epoch, config, data_file, z_file, save_z=False, use_precomputed_z=True):
+    def train_epoch(self, epoch, config, data_file, z_file, compute_z=False):
         epoch_start_time = time.time()
-        samples_processed = 0
         world_size = dist.get_world_size()
 
         with h5py.File(data_file, 'r') as f:
@@ -226,6 +230,9 @@ class IM_VAE(object):
             # Synchronize file names across processes
             if self.rank == 0:
                 np.random.shuffle(file_names)
+            
+            # Broadcast file names from rank 0
+            if self.rank == 0:
                 file_names_tensor = torch.tensor([ord(c) for c in ','.join(file_names)]).to(self.device_id)
                 size_tensor = torch.tensor([len(file_names_tensor)], dtype=torch.long).to(self.device_id)
             else:
@@ -240,139 +247,192 @@ class IM_VAE(object):
             if self.rank != 0:
                 file_names = ''.join([chr(i) for i in file_names_tensor.cpu().numpy()]).split(',')
 
-            total_files = len(file_names)
             epoch_total_loss = 0.0
             epoch_total_samples = 0
+            
+            for file_idx, file_name in enumerate(file_names):
+                if self.rank == 0:
+                    print(f"\nProcessing file {file_idx + 1}/{len(file_names)}: {file_name}")
 
-            # Open z_file in appropriate mode
-            z_file_mode = 'a' if save_z and self.rank == 0 else 'r'
-            with h5py.File(z_file, z_file_mode) as z_f:
-                for file_idx, file_name in enumerate(file_names):
-                    if self.rank == 0:
-                        print(f"\nProcessing file {file_idx + 1}/{total_files}: {file_name}")
-                    
-                    # Load and distribute data
-                    points = f[file_name]['points'][:]
-                    values = f[file_name]['values'][:]
-                    total_points = len(points)
-                    
-                    points_per_gpu = total_points // world_size
-                    start_idx = self.rank * points_per_gpu
-                    end_idx = start_idx + points_per_gpu if self.rank != world_size - 1 else total_points
-                    
-                    local_points = points[start_idx:end_idx]
-                    local_values = values[start_idx:end_idx]
-                    local_total_points = len(local_points)
+                # Load data
+                points = f[file_name]['points'][:]
+                values = f[file_name]['values'][:]
+                total_points = len(points)
 
-                    # Handle z vectors
-                    if use_precomputed_z and file_name in z_f:
-                        z_avg = torch.from_numpy(z_f[file_name]['z'][:]).float().to(self.device_id)
-                        mu_avg = torch.from_numpy(z_f[file_name]['mu'][:]).float().to(self.device_id)
-                        logvar_avg = torch.from_numpy(z_f[file_name]['logvar'][:]).float().to(self.device_id)
-                    else:
-                        # Compute z vectors if needed
+                # Distribute data across GPUs
+                points_per_gpu = total_points // world_size
+                remainder = total_points % world_size
+                start_idx = self.rank * points_per_gpu + min(self.rank, remainder)
+                end_idx = start_idx + points_per_gpu + (1 if self.rank < remainder else 0)
+
+                local_points = points[start_idx:end_idx]
+                local_values = values[start_idx:end_idx]
+                local_total_points = end_idx - start_idx
+
+                torch.cuda.synchronize()
+                dist.barrier()
+
+                # Handle z vectors
+                if not compute_z:
+                    # All processes read the precomputed z vectors
+                    try:
+                        with h5py.File(z_file, 'r') as z_f:
+                            z_avg = torch.from_numpy(z_f[file_name]['z'][:]).float().to(self.device_id)
+                            mu_avg = torch.from_numpy(z_f[file_name]['mu'][:]).float().to(self.device_id)
+                            logvar_avg = torch.from_numpy(z_f[file_name]['logvar'][:]).float().to(self.device_id)
+                    except Exception as e:
+                        print(f"Rank {self.rank} error reading z_file: {e}")
+                        raise
+                else:
+                    # In first epoch, compute and save z vectors
+                    if epoch == 0:
+                        if self.rank ==0:
+                            print("Computing z, this will only happen in epoch 0")
+                        # Compute z vectors
                         self.network.module.encoder.eval()
-                        z_sum = torch.zeros(self.z_dim, device=self.device_id)
-                        mu_sum = torch.zeros(self.z_dim, device=self.device_id)
-                        logvar_sum = torch.zeros(self.z_dim, device=self.device_id)
-                        total_chunks = 0
+                        z_sums = torch.zeros((3, self.z_dim), device=self.device_id)
+                        total_samples = 0
 
                         for chunk_start in range(0, local_total_points, self.chunk_size):
                             chunk_end = min(chunk_start + self.chunk_size, local_total_points)
                             points_chunk = torch.from_numpy(local_points[chunk_start:chunk_end]).float().to(self.device_id)
                             
-                            with torch.no_grad():
-                                mu, logvar, z = self.network.module.encoder(points_chunk)
-                                z_sum += z.sum(dim=0)
-                                mu_sum += mu.sum(dim=0)
-                                logvar_sum += logvar.sum(dim=0)
-                                total_chunks += (chunk_end - chunk_start)
+                            mu, logvar, z = self.compute_z_vectors(points_chunk)
+                            z_sums[0] += z.sum(dim=0)
+                            z_sums[1] += mu.sum(dim=0)
+                            z_sums[2] += logvar.sum(dim=0)
+                            total_samples += points_chunk.size(0)
 
-                        # Synchronize z vectors across GPUs
-                        stats = torch.stack([z_sum, mu_sum, logvar_sum, torch.tensor(total_chunks, device=self.device_id)])
-                        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-                        
-                        total_samples = stats[3].item()
-                        z_avg = stats[0] / total_samples
-                        mu_avg = stats[1] / total_samples
-                        logvar_avg = stats[2] / total_samples
+                        dist.all_reduce(z_sums)
+                        total_samples_tensor = torch.tensor([total_samples], device=self.device_id)
+                        dist.all_reduce(total_samples_tensor)
+                        total_samples = total_samples_tensor.item()
 
-                        if save_z and self.rank == 0:
-                            if file_name in z_f:
-                                del z_f[file_name]
-                            group = z_f.create_group(file_name)
-                            group.create_dataset('z', data=z_avg.cpu().numpy())
-                            group.create_dataset('mu', data=mu_avg.cpu().numpy())
-                            group.create_dataset('logvar', data=logvar_avg.cpu().numpy())
+                        z_avg = z_sums[0] / total_samples
+                        mu_avg = z_sums[1] / total_samples
+                        logvar_avg = z_sums[2] / total_samples
 
-                    # Training loop
-                    self.network.train()
-                    file_total_loss = 0.0
-                    file_processed_samples = 0
+                        # Only rank 0 writes to file
+                        if self.rank == 0:
+                            try:
+                                with h5py.File(z_file, 'a') as z_f:
+                                    if file_name in z_f:
+                                        del z_f[file_name]
+                                    group = z_f.create_group(file_name)
+                                    group.create_dataset('z', data=z_avg.cpu().numpy())
+                                    group.create_dataset('mu', data=mu_avg.cpu().numpy())
+                                    group.create_dataset('logvar', data=logvar_avg.cpu().numpy())
+                            except Exception as e:
+                                print(f"Rank 0 error writing z_file: {e}")
+                                raise
 
-                    for chunk_start in range(0, local_total_points, self.chunk_size):
-                        chunk_end = min(chunk_start + self.chunk_size, local_total_points)
-                        current_batch_size = chunk_end - chunk_start
-                        
-                        points_chunk = torch.from_numpy(local_points[chunk_start:chunk_end]).float().to(self.device_id)
-                        values_chunk = torch.from_numpy(local_values[chunk_start:chunk_end]).float().to(self.device_id)
+                        # Wait for rank 0 to finish writing
+                        dist.barrier()
+                    else:
+                        # In subsequent epochs, read the saved z vectors
+                        try:
+                            with h5py.File(z_file, 'r') as z_f:
+                                z_avg = torch.from_numpy(z_f[file_name]['z'][:]).float().to(self.device_id)
+                                mu_avg = torch.from_numpy(z_f[file_name]['mu'][:]).float().to(self.device_id)
+                                logvar_avg = torch.from_numpy(z_f[file_name]['logvar'][:]).float().to(self.device_id)
+                        except Exception as e:
+                            print(f"Rank {self.rank} error reading z_file: {e}")
+                            raise
 
-                        self.optimizer.zero_grad()
-                        predicted_densities = self.network.module.generator(points_chunk, z_avg)
-                        loss = self.combined_loss(predicted_densities, values_chunk)
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.grad_clip)
-                        self.optimizer.step()
+                    dist.barrier()  # Wait for rank 0 to finish writing
 
-                        # Update loss statistics
-                        current_loss = loss.item()
-                        file_total_loss += current_loss * current_batch_size
-                        file_processed_samples += current_batch_size
+                # Training loop
+                # Training loop
+                self.network.train()
+                file_total_loss = 0.0
+                file_processed_samples = 0
 
-                        # Progress reporting
-                        if self.rank == 0 and (chunk_start // self.chunk_size) % 15 == 0:
-                            progress = (chunk_start + self.chunk_size) / local_total_points * 100
-                            current_avg = file_total_loss / file_processed_samples if file_processed_samples > 0 else 0
-                            print(f"Progress: {progress:.1f}% - "
-                                f"Current Loss: {current_loss:.6f} - "
-                                f"Running Avg Loss: {current_avg:.6f}")
+                for chunk_start in range(0, local_total_points, self.chunk_size):
+                    chunk_end = min(chunk_start + self.chunk_size, local_total_points)
+                    current_batch_size = chunk_end - chunk_start
 
-                        del points_chunk, values_chunk, predicted_densities, loss
-                        torch.cuda.empty_cache()
+                    points_chunk = torch.from_numpy(local_points[chunk_start:chunk_end]).float().to(self.device_id)
+                    values_chunk = torch.from_numpy(local_values[chunk_start:chunk_end]).float().to(self.device_id)
 
-                    # Synchronize file statistics across GPUs
-                    file_stats = torch.tensor([file_total_loss, file_processed_samples], 
-                                        dtype=torch.float64, device=self.device_id)
-                    dist.all_reduce(file_stats, op=dist.ReduceOp.SUM)
+                    # Synchronize before forward pass
+                    dist.barrier()
                     
-                    file_total_loss = file_stats[0].item()
-                    file_total_samples = file_stats[1].item()
+                    self.optimizer.zero_grad()
                     
-                    epoch_total_loss += file_total_loss
-                    epoch_total_samples += file_total_samples
+                    # Forward pass
+                    predicted_densities = self.network.module.generator(points_chunk, z_avg)
+                    loss = self.combined_loss(predicted_densities, values_chunk)
+                    
+                    # Synchronize before backward pass for simultaneous backpropagation
+                    dist.barrier()
+                    loss.backward()
+                    
+                    # Wait for all GPUs to complete backward pass
+                    dist.barrier()
+                    
+                    # Clip gradients after all GPUs finish backward pass
+                    torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.grad_clip)
+                    
+                    # Synchronize gradients across GPUs
+                    for param in self.network.parameters():
+                        if param.grad is not None:
+                            dist.all_reduce(param.grad.data)
+                            param.grad.data /= world_size
+                    
+                    self.optimizer.step()
 
-                    if self.rank == 0:
-                        file_avg_loss = file_total_loss / file_total_samples if file_total_samples > 0 else 0
-                        print(f"\nFile {file_name} completed - Average Loss: {file_avg_loss:.6f}")
+                    # Calculate weighted loss for this batch
+                    loss_value = loss.item() * current_batch_size
+                    
+                    # All-reduce to get total loss across all processes
+                    stats = torch.tensor([loss_value, current_batch_size], device=self.device_id)
+                    dist.all_reduce(stats)
+                    total_loss = stats[0].item()
+                    total_samples = stats[1].item()
+                    current_avg_loss = total_loss / total_samples
 
-            # Calculate final epoch statistics
-            epoch_stats = torch.tensor([epoch_total_loss, epoch_total_samples], 
-                                    dtype=torch.float64, device=self.device_id)
-            dist.all_reduce(epoch_stats, op=dist.ReduceOp.SUM)
+                    # Update running statistics
+                    file_total_loss += total_loss
+                    file_processed_samples += total_samples
+                    running_avg_loss = file_total_loss / file_processed_samples
+
+                    if self.rank == 0 and (chunk_start // self.chunk_size) % 15 == 0:
+                        progress = chunk_start / local_total_points * 100
+                        print(f"Progress: {progress:.1f}% - "
+                            f"Current Loss: {current_avg_loss:.6f} - "
+                            f"Running Avg Loss: {running_avg_loss:.6f}")
+
+                    del points_chunk, values_chunk, predicted_densities, loss
+                    torch.cuda.empty_cache()
+
+                stats_tensor = torch.tensor([file_total_loss, file_processed_samples], device=self.device_id)
+                dist.all_reduce(stats_tensor)
+                
+                file_total_loss = stats_tensor[0].item()
+                file_total_samples = stats_tensor[1].item()
+
+                epoch_total_loss += file_total_loss
+                epoch_total_samples += file_total_samples
+
+                if self.rank == 0:
+                    file_avg_loss = file_total_loss / file_total_samples if file_total_samples > 0 else 0
+                    print(f"\nFile {file_name} completed - Average Loss: {file_avg_loss:.6f}")
+
+                torch.cuda.synchronize()
+                dist.barrier()
+
+            epoch_stats = torch.tensor([epoch_total_loss, epoch_total_samples], device=self.device_id)
+            dist.all_reduce(epoch_stats)
             
-            final_total_loss = epoch_stats[0].item()
-            final_total_samples = epoch_stats[1].item()
-            
-            final_avg_loss = final_total_loss / final_total_samples if final_total_samples > 0 else float('inf')
+            epoch_avg_loss = epoch_stats[0].item() / epoch_stats[1].item() if epoch_stats[1].item() > 0 else float('inf')
 
             if self.rank == 0:
                 epoch_time = time.time() - epoch_start_time
                 print(f"\nEpoch Summary:")
-                print(f"Total Samples: {final_total_samples}")
-                print(f"Average Loss: {final_avg_loss:.6f}")
+                print(f"Average Loss: {epoch_avg_loss:.6f}")
                 print(f"Time: {epoch_time:.2f} seconds")
 
-            return final_avg_loss
+            return epoch_avg_loss
 
     def save_checkpoint(self, epoch, loss, is_best=False):
         """Save checkpoint with optional best model saving."""
