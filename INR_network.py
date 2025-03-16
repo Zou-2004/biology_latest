@@ -189,49 +189,13 @@ class generator(nn.Module):
         out = self.output_layer(x)  # [N, 1]
         
         return out
-    
 
-# class encoder(nn.Module):
-#     def __init__(self, ef_dim, z_dim):
-#         super(encoder, self).__init__()
-#         self.ef_dim = ef_dim
-#         self.z_dim = z_dim
-        
-#         self.density_net = nn.Sequential(
-#             nn.Linear(1, self.ef_dim),
-#             nn.LayerNorm(self.ef_dim),
-#             nn.LeakyReLU(0.02),
-#             nn.Linear(self.ef_dim, self.ef_dim*2),
-#             nn.LayerNorm(self.ef_dim*2),
-#             nn.LeakyReLU(0.02),
-#             nn.Linear(self.ef_dim*2, self.ef_dim*4),
-#             nn.LayerNorm(self.ef_dim*4),
-#             nn.LeakyReLU(0.02)
-#         )
-        
-#         self.aggregation_net = nn.Linear(self.ef_dim*4, self.ef_dim*8)
-#         self.norm_agg = nn.LayerNorm(self.ef_dim*8)
-#         self.fc_z = nn.Linear(self.ef_dim*8, self.z_dim)
-    
-#     def forward(self, density_values):
-#         if len(density_values.shape) == 1:
-#             density_values = density_values.unsqueeze(-1)
-#         # Chain operations to minimize memory
-#         z = self.fc_z(
-#             F.leaky_relu(
-#                 self.norm_agg(self.aggregation_net(self.density_net(density_values))),
-#                 negative_slope=0.02
-#             )
-#         ).mean(dim=0)  # [z_dim]
-#         return z
-
-class im_network(nn.Module):
+class INR_Network(nn.Module):
     def __init__(self, ef_dim, gf_dim, z_dim, point_dim):
-        super(im_network, self).__init__()
+        super(INR_Network, self).__init__()
         self.ef_dim = ef_dim
         self.gf_dim = gf_dim
         self.z_dim = z_dim
         self.point_dim = point_dim
         self.num_frequencies=num_frequencies
-        # self.encoder = encoder(self.ef_dim, self.z_dim)
         self.generator = generator(self.z_dim, self.point_dim, self.gf_dim,self.num_frequencies)
