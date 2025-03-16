@@ -5,7 +5,7 @@ import os
 from train import im_network
 import h5py
 from tqdm import tqdm
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 class DensityPredictor:
     def __init__(self, checkpoint_path, device='cuda'):
         self.device = device
@@ -14,13 +14,22 @@ class DensityPredictor:
         self.gf_dim = 256
         self.z_dim = 256
         self.chunk_size = 100000
-        self.num_ferquencies=10
         # Load network
         self.network = im_network(self.ef_dim, self.gf_dim, self.z_dim, self.point_dim).to(device)
         
         # Load checkpoint
         checkpoint = torch.load(checkpoint_path)
-        self.network.load_state_dict(checkpoint['model_state_dict'])
+        # Filter the state dictionary to only include keys that are in the current model
+        model_dict = self.network.state_dict()
+        pretrained_dict = {k: v for k, v in checkpoint['model_state_dict'].items() 
+                        if k in model_dict}
+        
+        # Check what keys were loaded
+        print(f"Successfully loaded {len(pretrained_dict)} parameters")
+        print(f"Missing {len(model_dict) - len(pretrained_dict)} parameters")
+        
+        # Load the filtered state dictionary
+        self.network.load_state_dict(pretrained_dict, strict=False)
         self.network.eval()
 
     def predict_density_batched(self, coords, z_vector):
@@ -60,7 +69,7 @@ class DensityPredictor:
             print(f"Z vector shape: {z_vector.shape}")
             raise
 
-def create_density_map(checkpoint_path, z_vectors_path, output_dir, volume_shape, spacing=(1.0, 1.0, 1.0)):
+def create_density_map(checkpoint_path, z_vectors_path, output_dir, volume_shape):
     predictor = DensityPredictor(checkpoint_path=checkpoint_path)
     
     # Create integer coordinates first
@@ -87,7 +96,7 @@ def create_density_map(checkpoint_path, z_vectors_path, output_dir, volume_shape
         for idx, file_name in tqdm(enumerate(file_names)):
             print(f"\nProcessing file: {file_name} ({idx+1}/{len(file_names)})")
             
-            z_vector = torch.from_numpy(z_file[file_name]['z'][:]).float()
+            z_vector = torch.from_numpy(z_file[file_name][:]).float()
             print(f"Z vector shape: {z_vector.shape}")
             
             try:
@@ -119,9 +128,10 @@ def create_density_map(checkpoint_path, z_vectors_path, output_dir, volume_shape
 
 def main():
     volume_shape = (272, 632, 632)
-    voxel_spacing = (1.0, 1.0, 1.0)  # Voxel spacing in Angstroms
-    checkpoint_path = "/home/zcy/seperate_VAE/checkpoint/density_density_vae/best_IM_VAE.model.pth"
-    z_vectors_path = '/home/zcy/seperate_VAE/z_vectors.hdf5'
+    # voxel_spacing = (1.0, 1.0, 1.0)  # Voxel spacing in Angstroms 
+    checkpoint_path = "/home/zcy/seperate_VAE/checkpoint/density_density_ae/model_best.pth"
+    # checkpoint_path = "/home/zcy/seperate_VAE/checkpoint/density_density_vae/best_IM_VAE.model.pth"
+    z_vectors_path = '/home/zcy/seperate_VAE/checkpoint/density_density_ae/best_z_vectors.hdf5'
     output_dir = "/home/zcy/seperate_VAE/output"
     
     os.makedirs(output_dir, exist_ok=True)
@@ -132,7 +142,6 @@ def main():
             z_vectors_path=z_vectors_path,
             output_dir=output_dir,
             volume_shape=volume_shape,
-            spacing=voxel_spacing
         )
         print(f"Successfully finished creating density maps in: {output_dir}")
     
