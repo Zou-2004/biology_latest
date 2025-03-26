@@ -2,43 +2,50 @@ import torch
 import numpy as np
 import mrcfile
 import os
-from train import im_network
+from train import INR_Network  # Ensure this imports the updated INR_Network with Sigmoid
 import h5py
 from tqdm import tqdm
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 class DensityPredictor:
     def __init__(self, checkpoint_path, device='cuda'):
         self.device = device
         self.point_dim = 3
-        self.ef_dim = 256
-        self.gf_dim = 256
-        self.z_dim = 256
+        self.ef_dim = 128  # Match training config
+        self.gf_dim = 128  # Match training config
+        self.z_dim = 64    # Match training config
         self.chunk_size = 100000
-        # Load network
-        self.network = im_network(self.ef_dim, self.gf_dim, self.z_dim, self.point_dim).to(device)
-        
+        self.num_frequencies = 10
+
         # Load checkpoint
-        checkpoint = torch.load(checkpoint_path)
-        # Filter the state dictionary to only include keys that are in the current model
-        model_dict = self.network.state_dict()
-        pretrained_dict = {k: v for k, v in checkpoint['model_state_dict'].items() 
-                        if k in model_dict}
+        checkpoint = torch.load(checkpoint_path, map_location=device)
         
-        # Check what keys were loaded
-        print(f"Successfully loaded {len(pretrained_dict)} parameters")
-        print(f"Missing {len(model_dict) - len(pretrained_dict)} parameters")
-        
-        # Load the filtered state dictionary
-        self.network.load_state_dict(pretrained_dict, strict=False)
+        # Initialize network
+        self.network = INR_Network(self.ef_dim, self.gf_dim, self.z_dim, self.point_dim, self.num_frequencies).to(device)
+        self.network.load_state_dict(checkpoint['model_state_dict'])
         self.network.eval()
+
+        # Load z-vectors and normalization parameters from the checkpoint
+        self.z_vectors = checkpoint['z_vectors']  # Dictionary of z-vectors
+        self.norm_params = checkpoint['norm_params']  # Dictionary of normalization parameters
+
+        # Convert z-vectors to tensors on the correct device
+        for fname in self.z_vectors:
+            self.z_vectors[fname] = self.z_vectors[fname].to(device)
+
+        if '00256_10.00Apx' in self.norm_params:
+            print(f"Normalization parameters for 00256_10.00Apx: {self.norm_params['00256_10.00Apx']}")
+        else:
+            print("Warning: Normalization parameters for 00256_10.00Apx not found in checkpoint.")
 
     def predict_density_batched(self, coords, z_vector):
         try:
             total_points = coords.shape[0]
             predictions = np.zeros((total_points,), dtype=np.float32)
             
-            if len(z_vector.shape) == 2 and z_vector.size(0) > 1:
-                z_vector = z_vector.mean(dim=0, keepdim=True)
+            if len(z_vector.shape) == 1:
+                z_vector = z_vector.unsqueeze(0)  # Ensure z_vector is [1, z_dim]
             
             for start_idx in range(0, total_points, self.chunk_size):
                 end_idx = min(start_idx + self.chunk_size, total_points)
@@ -46,12 +53,9 @@ class DensityPredictor:
                 
                 with torch.no_grad():
                     coords_tensor = torch.from_numpy(chunk_coords).float().to(self.device)
-                    # if len(coords_tensor.shape) == 2:
-                    #     coords_tensor = coords_tensor.unsqueeze(0)
-                    
                     z_tensor = z_vector.to(self.device)
                     
-                    # Get predictions
+                    # Get predictions (assumed [0, 1] with Sigmoid)
                     chunk_pred = self.network.generator(coords_tensor, z_tensor)
                     chunk_values = chunk_pred.cpu().numpy()
                     
@@ -69,10 +73,23 @@ class DensityPredictor:
             print(f"Z vector shape: {z_vector.shape}")
             raise
 
-def create_density_map(checkpoint_path, z_vectors_path, output_dir, volume_shape):
+def denormalize_densities(normalized_densities, norm_params):
+    """Denormalize densities from [0, 1] range back to original range."""
+    if not norm_params or 'original_min' not in norm_params or 'original_max' not in norm_params:
+        print("Warning: Missing normalization parameters. Using normalized values as-is.")
+        return normalized_densities
+    
+    orig_min = norm_params['original_min']
+    orig_max = norm_params['original_max']
+    
+    # Assuming input is [0, 1], scale back to original range
+    denormalized = normalized_densities * (orig_max - orig_min) + orig_min
+    return denormalized
+
+def create_density_map(checkpoint_path, output_dir, volume_shape):
     predictor = DensityPredictor(checkpoint_path=checkpoint_path)
     
-    # Create integer coordinates first
+    # Create integer coordinates
     x = np.arange(volume_shape[0])
     y = np.arange(volume_shape[1])
     z = np.arange(volume_shape[2])
@@ -81,57 +98,76 @@ def create_density_map(checkpoint_path, z_vectors_path, output_dir, volume_shape
     # Store integer coordinates for later use
     int_coords = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
     
-    # Normalize coordinates for network input [0,1]
+    # Normalize coordinates for network input [0, 1]
     grid_points = int_coords / (np.array(volume_shape) - 1)
     
     print(f"Total grid points: {grid_points.shape[0]}")
     print(f"Volume shape: {volume_shape}")
     print(f"Normalized coordinate range: [{grid_points.min():.4f}, {grid_points.max():.4f}]")
-    # print(f"Integer coordinate range: [{int_coords.min()}, {int_coords.max()}]")
     
-    with h5py.File(z_vectors_path, 'r') as z_file:
-        file_names = list(z_file.keys())
-        print(f"Found {len(file_names)} files to process")
+    # Use z-vectors and normalization parameters from the checkpoint
+    file_names = list(predictor.z_vectors.keys())
+    print(f"Found {len(file_names)} files to process")
+    
+    for idx, file_name in tqdm(enumerate(file_names)):
+        print(f"\nProcessing file: {file_name} ({idx+1}/{len(file_names)})")
         
-        for idx, file_name in tqdm(enumerate(file_names)):
-            print(f"\nProcessing file: {file_name} ({idx+1}/{len(file_names)})")
+        z_vector = predictor.z_vectors[file_name]
+        print(f"Z vector shape: {z_vector.shape}")
+        
+        # Get file-specific normalization params from the checkpoint
+        norm_params = predictor.norm_params.get(file_name, {})
+        
+        if not norm_params:
+            print(f"Warning: No normalization parameters found for {file_name}. Using default parameters.")
+            norm_params = {
+                'original_min': -0.3,  # Adjust defaults based on your data
+                'original_max': 0.2
+            }
+        
+        print(f"Using normalization parameters: {norm_params}")
+        
+        try:
+            # Initialize empty volume
+            volume = np.zeros(volume_shape, dtype=np.float32)
             
-            z_vector = torch.from_numpy(z_file[file_name][:]).float()
-            print(f"Z vector shape: {z_vector.shape}")
+            # Predict densities using normalized coordinates
+            normalized_densities = predictor.predict_density_batched(grid_points, z_vector)
             
-            try:
-                # Initialize empty volume
-                volume = np.zeros(volume_shape, dtype=np.float32)
-                
-                # Predict densities using normalized coordinates
-                densities = predictor.predict_density_batched(grid_points, z_vector)
-                
-                # Place densities at integer coordinates
-                volume[int_coords[:, 0], int_coords[:, 1], int_coords[:, 2]] = densities.squeeze()
-                
-                output_path = os.path.join(output_dir, f'{file_name}.mrc')
-                with mrcfile.new(output_path, overwrite=True) as mrc:
-                    mrc.set_data(volume)
-                    # mrc.voxel_size = spacing
-                    mrc.update_header_from_data()
-                
-                print(f"Created density map at: {output_path}")
-                print(f"Volume range: {volume.min():.4f} to {volume.max():.4f}")
-                print(f"Volume shape: {volume.shape}")
-                
-            except Exception as e:
-                print(f"Error processing file {file_name}: {str(e)}")
-                continue
+            # Check the range of normalized densities from the model
+            norm_min = normalized_densities.min()
+            norm_max = normalized_densities.max()
+            print(f"Raw model output range: [{norm_min:.4f}, {norm_max:.4f}]")
             
-            finally:
-                torch.cuda.empty_cache()
+            # Clamp values to [0, 1] if they exceed this range (shouldn’t happen with Sigmoid)
+            if norm_min < 0.0 or norm_max > 1.0:
+                print(f"Warning: Model outputs exceed [0, 1] range. Clamping values.")
+                normalized_densities = np.clip(normalized_densities, 0.0, 1.0)
+            
+            # Denormalize the densities
+            densities = denormalize_densities(normalized_densities, norm_params)
+            
+            # Place densities at integer coordinates
+            volume[int_coords[:, 0], int_coords[:, 1], int_coords[:, 2]] = densities.squeeze()
+            
+            output_path = os.path.join(output_dir, f'{file_name}.mrc')
+            with mrcfile.new(output_path, overwrite=True) as mrc:
+                mrc.set_data(volume)
+                mrc.update_header_from_data()
+            
+            print(f"Created density map at: {output_path}")
+            print(f"Final volume range: {volume.min():.4f} to {volume.max():.4f}")
+            
+        except Exception as e:
+            print(f"Error processing file {file_name}: {str(e)}")
+            continue
+        
+        finally:
+            torch.cuda.empty_cache()
 
 def main():
-    volume_shape = (272, 632, 632)
-    # voxel_spacing = (1.0, 1.0, 1.0)  # Voxel spacing in Angstroms 
-    checkpoint_path = "/home/zcy/seperate_VAE/checkpoint/density_density_ae/model_best.pth"
-    # checkpoint_path = "/home/zcy/seperate_VAE/checkpoint/density_density_vae/best_IM_VAE.model.pth"
-    z_vectors_path = '/home/zcy/seperate_VAE/checkpoint/density_density_ae/best_z_vectors.hdf5'
+    volume_shape = (272, 632, 632)  # Matches your map "00256_10.00Apx.mrc"
+    checkpoint_path = "/home/zcy/seperate_VAE/fresh/cri_loss_1/model_best.pth"
     output_dir = "/home/zcy/seperate_VAE/output"
     
     os.makedirs(output_dir, exist_ok=True)
@@ -139,7 +175,6 @@ def main():
     try:
         create_density_map(
             checkpoint_path=checkpoint_path,
-            z_vectors_path=z_vectors_path,
             output_dir=output_dir,
             volume_shape=volume_shape,
         )
@@ -153,5 +188,5 @@ def main():
     finally:
         torch.cuda.empty_cache()
 
-if __name__ =="__main__":
+if __name__ == "__main__":
     main()

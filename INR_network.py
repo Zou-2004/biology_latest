@@ -5,10 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-#positional encoding frequency
-num_frequencies=10
-
-
 def positional_encoding(points, num_frequencies, include_input=True, log_sampling=True):
     """
     Apply positional encoding to 3D coordinates (NeRF-style).
@@ -39,7 +35,6 @@ def positional_encoding(points, num_frequencies, include_input=True, log_samplin
 
     # Concatenate original coordinates and encoded features
     return torch.cat(encoded, dim=-1)
-
 
 class generator(nn.Module):
     def __init__(self, z_dim, point_dim, gf_dim, num_frequencies, include_input=True):
@@ -79,7 +74,7 @@ class generator(nn.Module):
             nn.LeakyReLU(negative_slope=0.02)
         )
         
-        # Transition block 1 (gf_dim * A → gf_dim * 4)
+        # Transition block 1 (gf_dim * 8 → gf_dim * 4)
         self.transition1 = nn.Sequential(
             nn.Linear(self.gf_dim * 8, self.gf_dim * 4, bias=True),
             nn.LeakyReLU(negative_slope=0.02)
@@ -119,22 +114,22 @@ class generator(nn.Module):
             nn.LeakyReLU(negative_slope=0.02)
         )
         
-        # Output layer
-        self.output_layer = nn.Linear(self.gf_dim, 1, bias=True)
+        # Output layer with tanh to constrain output to [-1, 1]
+        self.output_layer = nn.Sequential(
+            nn.Linear(self.gf_dim, 1, bias=True),
+            nn.Sigmoid()  # Output constrained to [0, 1]
+        )
+        
         
         # Initialize weights
         self._initialize_weights()
 
     def _initialize_weights(self):
-        # Initialize all linear layers
+        # Initialize all linear layers with smaller std
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0.0, std=0.05)
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)  # Reduced std from 0.05 to 0.01
                 nn.init.constant_(m.bias, 0)
-        
-        # Special initialization for output layer
-        nn.init.normal_(self.output_layer.weight, mean=0.0, std=0.05)
-        nn.init.constant_(self.output_layer.bias, 0)
 
     def forward(self, points, z):
         """
@@ -185,17 +180,17 @@ class generator(nn.Module):
         # Final processing
         x = self.final_block(x)  # [N, gf_dim]
         
-        # Output layer
-        out = self.output_layer(x)  # [N, 1]
+        # Output layer with tanh
+        out = self.output_layer(x)  # [N, 1], constrained to [-1, 1]
         
         return out
 
 class INR_Network(nn.Module):
-    def __init__(self, ef_dim, gf_dim, z_dim, point_dim):
+    def __init__(self, ef_dim, gf_dim, z_dim, point_dim, num_frequencies):
         super(INR_Network, self).__init__()
         self.ef_dim = ef_dim
         self.gf_dim = gf_dim
         self.z_dim = z_dim
         self.point_dim = point_dim
-        self.num_frequencies=num_frequencies
-        self.generator = generator(self.z_dim, self.point_dim, self.gf_dim,self.num_frequencies)
+        self.num_frequencies = num_frequencies
+        self.generator = generator(self.z_dim, self.point_dim, self.gf_dim, self.num_frequencies)
